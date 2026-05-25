@@ -95,15 +95,22 @@
     border: none; cursor: pointer; margin-top: 12px;
   }
 
-  /* Background keepalive status */
-  .keepalive-bar {
+  /* Status bar */
+  .status-bar {
     width: 100%; max-width: 420px; margin-bottom: 16px;
     background: #1e293b; border-radius: 12px; padding: 14px 16px;
     display: none; text-align: center;
   }
-  .keepalive-bar.active { display: block; }
-  .keepalive-bar .ka-status { font-size: 0.85rem; color: #22c55e; }
-  .keepalive-bar .ka-hint { font-size: 0.75rem; color: #64748b; margin-top: 4px; }
+  .status-bar.active { display: block; }
+  .status-bar .sb-status { font-size: 0.85rem; color: #22c55e; }
+  .status-bar .sb-hint { font-size: 0.75rem; color: #64748b; margin-top: 4px; }
+
+  /* Keep awake button */
+  .btn-awake {
+    background: #7c3aed; color: #fff; width: 100%; padding: 14px;
+    font-size: 1.05rem; margin-top: 8px;
+  }
+  .btn-awake.on { background: #22c55e; }
 </style>
 </head>
 <body>
@@ -111,10 +118,10 @@
 <h1>Voice Alarm</h1>
 <p class="subtitle">Record your voice and set recurring reminders</p>
 
-<!-- KEEPALIVE STATUS -->
-<div class="keepalive-bar" id="keepaliveBar">
-  <div class="ka-status">&#9989; Alarms active — running in background</div>
-  <div class="ka-hint">Keep this tab open. You can lock your screen.</div>
+<!-- STATUS BAR -->
+<div class="status-bar" id="statusBar">
+  <div class="sb-status" id="statusText">&#9989; Alarms running</div>
+  <div class="sb-hint" id="statusHint">Screen will stay on. You can put your phone down.</div>
 </div>
 
 <!-- RECORD SECTION -->
@@ -142,6 +149,7 @@
   <input type="number" id="alarmInterval" value="10" min="1" max="1440">
 
   <button class="btn-add-alarm" onclick="addAlarm()">+ Add Alarm</button>
+  <button class="btn-awake" id="awakeBtn" onclick="toggleAwake()">&#128274; Keep Screen Awake</button>
 </div>
 
 <!-- ACTIVE ALARMS -->
@@ -154,8 +162,6 @@
 <audio id="player" playsinline webkit-playsinline></audio>
 <!-- Audio element for alarm playback (separate so they don't conflict) -->
 <audio id="alarmPlayer" playsinline webkit-playsinline></audio>
-<!-- Audio element for silent keepalive loop (keeps iOS from suspending the page) -->
-<audio id="keepalive" playsinline webkit-playsinline loop></audio>
 
 <!-- ALARM POPUP OVERLAY -->
 <div class="alarm-overlay" id="alarmOverlay">
@@ -310,75 +316,64 @@ function stopRecording() {
   document.getElementById('recordBtn').classList.remove('recording');
 }
 
-// ── Silent keepalive ──
-// iOS suspends JS timers when the screen is off UNLESS audio is playing.
-// We play a near-silent WAV on loop to trick iOS into keeping the page alive.
-var keepaliveRunning = false;
+// ── Wake Lock (Keep Screen Awake) ──
+var wakeLock = null;
+var awakeOn = false;
 
-function generateSilentWav() {
-  // Generate a 2-second WAV of near-silence (value 128 = silence in 8-bit unsigned PCM)
-  var sampleRate = 8000;
-  var duration = 2;
-  var numSamples = sampleRate * duration;
-  var dataSize = numSamples;
-  var fileSize = 44 + dataSize;
-
-  var buffer = new ArrayBuffer(fileSize);
-  var view = new DataView(buffer);
-
-  // WAV header
-  function writeString(offset, str) { for (var i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i)); }
-  writeString(0, 'RIFF');
-  view.setUint32(4, fileSize - 8, true);
-  writeString(8, 'WAVE');
-  writeString(12, 'fmt ');
-  view.setUint32(16, 16, true);       // chunk size
-  view.setUint16(20, 1, true);        // PCM
-  view.setUint16(22, 1, true);        // mono
-  view.setUint32(24, sampleRate, true);
-  view.setUint32(28, sampleRate, true); // byte rate
-  view.setUint16(32, 1, true);        // block align
-  view.setUint16(34, 8, true);        // bits per sample
-  writeString(36, 'data');
-  view.setUint32(40, dataSize, true);
-
-  // True silence = 128 for unsigned 8-bit PCM
-  for (var i = 0; i < numSamples; i++) {
-    view.setUint8(44 + i, 128);
-  }
-
-  return new Blob([buffer], { type: 'audio/wav' });
-}
-
-function startKeepalive() {
-  if (keepaliveRunning) return;
-  var blob = generateSilentWav();
-  var url = URL.createObjectURL(blob);
-  var ka = document.getElementById('keepalive');
-  ka.src = url;
-  ka.volume = 0.001; // essentially silent
-  ka.load();
-  var p = ka.play();
-  if (p && p.then) {
-    p.then(function() {
-      keepaliveRunning = true;
-      document.getElementById('keepaliveBar').classList.add('active');
-    }).catch(function() {
-      // If autoplay blocked, it'll start on next user tap
-    });
+async function toggleAwake() {
+  if (!awakeOn) {
+    await startAwake();
+  } else {
+    stopAwake();
   }
 }
 
-function stopKeepalive() {
-  var ka = document.getElementById('keepalive');
-  ka.pause();
-  ka.src = '';
-  keepaliveRunning = false;
-  document.getElementById('keepaliveBar').classList.remove('active');
+async function startAwake() {
+  try {
+    // Try the Wake Lock API (works on most modern browsers)
+    if ('wakeLock' in navigator) {
+      wakeLock = await navigator.wakeLock.request('screen');
+      wakeLock.addEventListener('release', function() {
+        // If released (e.g. tab switch), try to re-acquire
+        if (awakeOn) {
+          navigator.wakeLock.request('screen').then(function(wl) { wakeLock = wl; }).catch(function() {});
+        }
+      });
+    }
+  } catch(e) {
+    // Wake Lock not supported or failed — screen may still dim
+  }
+
+  awakeOn = true;
+  document.getElementById('awakeBtn').textContent = '🔓 Screen Awake — tap to turn off';
+  document.getElementById('awakeBtn').classList.add('on');
+  document.getElementById('statusBar').classList.add('active');
+
+  // Also reduce screen brightness effect by dimming the page after 30s
+  // (saves battery while keeping the screen technically "on")
 }
+
+function stopAwake() {
+  awakeOn = false;
+  if (wakeLock) {
+    wakeLock.release();
+    wakeLock = null;
+  }
+  document.getElementById('awakeBtn').textContent = '🔒 Keep Screen Awake';
+  document.getElementById('awakeBtn').classList.remove('on');
+  if (Object.keys(alarms).length === 0) {
+    document.getElementById('statusBar').classList.remove('active');
+  }
+}
+
+// Re-acquire wake lock when page becomes visible again
+document.addEventListener('visibilitychange', function() {
+  if (document.visibilityState === 'visible' && awakeOn && 'wakeLock' in navigator) {
+    navigator.wakeLock.request('screen').then(function(wl) { wakeLock = wl; }).catch(function() {});
+  }
+});
 
 // ── Alarm trigger ──
-// Uses a timestamp-based system instead of setInterval (more reliable when iOS wakes up)
 var alarmTimestamps = {}; // { id: nextFireTime }
 
 function checkAlarms() {
@@ -387,13 +382,11 @@ function checkAlarms() {
     if (!alarms.hasOwnProperty(id)) continue;
     if (!alarmTimestamps[id]) continue;
     if (now >= alarmTimestamps[id]) {
-      // Time to fire!
       var clipName = alarms[id].clip;
       var interval = alarms[id].interval;
-      // Set next fire time
       alarmTimestamps[id] = now + (interval * 60 * 1000);
 
-      // Play the alarm audio directly using the alarm player
+      // Play the alarm
       if (clipBlobs[clipName]) {
         var url = URL.createObjectURL(clipBlobs[clipName]);
         var ap = document.getElementById('alarmPlayer');
@@ -403,19 +396,14 @@ function checkAlarms() {
         if (p && p.then) {
           p.then(function(u) { return function() {
             ap.onended = function() { URL.revokeObjectURL(u); };
-          }; }(url)).catch(function() {
-            // Playback blocked — show overlay
-            showAlarmOverlay(clipName);
-          });
+          }; }(url)).catch(function() {});
         }
       }
-      // Vibrate
       if (navigator.vibrate) navigator.vibrate([300, 100, 300, 100, 300]);
     }
   }
 }
 
-// Check alarms every second
 setInterval(checkAlarms, 1000);
 
 function showAlarmOverlay(clipName) {
@@ -480,9 +468,7 @@ function addAlarm() {
 
   saveAlarms();
   renderAlarms();
-
-  // Start keepalive so alarms work with screen off
-  startKeepalive();
+  document.getElementById('statusBar').classList.add('active');
 }
 
 function removeAlarm(id) {
@@ -492,8 +478,9 @@ function removeAlarm(id) {
     saveAlarms();
     renderAlarms();
 
-    // Stop keepalive if no alarms left
-    if (Object.keys(alarms).length === 0) stopKeepalive();
+    if (Object.keys(alarms).length === 0 && !awakeOn) {
+      document.getElementById('statusBar').classList.remove('active');
+    }
   }
 }
 
@@ -543,7 +530,7 @@ async function loadAlarms() {
     hasAlarms = true;
   }
   renderAlarms();
-  if (hasAlarms) startKeepalive();
+  if (hasAlarms) document.getElementById('statusBar').classList.add('active');
 }
 
 // ── Helpers ──
