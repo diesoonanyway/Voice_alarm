@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Audio Test</title>
+<style>
+  body { font-family: -apple-system, sans-serif; background: #111; color: #eee; padding: 20px; }
+  button { display: block; width: 100%; padding: 16px; margin: 10px 0; border: none; border-radius: 12px; font-size: 1.1rem; font-weight: 600; cursor: pointer; }
+  .record { background: #ef4444; color: #fff; }
+  .record.on { animation: pulse 0.8s infinite; }
+  @keyframes pulse { 50% { opacity: 0.6; } }
+  .play { background: #22c55e; color: #fff; }
+  .info { background: #1e293b; padding: 12px; border-radius: 10px; margin: 10px 0; font-size: 0.85rem; color: #94a3b8; }
+  .log { background: #0f172a; padding: 10px; border-radius: 8px; margin: 6px 0; font-size: 0.8rem; color: #38bdf8; word-break: break-all; }
+  h2 { color: #38bdf8; margin-top: 24px; }
+</style>
+</head>
+<body>
+
+<h1>iPhone Audio Test</h1>
+<p class="info">This page tests different audio playback methods to find what works on your iPhone. Record first, then try each Play button.</p>
+
+<h2>Step 1: Record</h2>
+<button class="record" id="recBtn" onclick="toggleRec()">Tap to Record</button>
+<div id="recLog"></div>
+
+<h2>Step 2: Try each Play method</h2>
+
+<button class="play" onclick="testMethod1()">Method 1: Audio element + object URL</button>
+<div id="log1"></div>
+
+<button class="play" onclick="testMethod2()">Method 2: Audio element + base64 src</button>
+<div id="log2"></div>
+
+<button class="play" onclick="testMethod3()">Method 3: Web Audio API decodeAudioData</button>
+<div id="log3"></div>
+
+<button class="play" onclick="testMethod4()">Method 4: Audio element with controls</button>
+<div id="log4"></div>
+
+<!-- Visible audio player for Method 4 -->
+<audio id="visiblePlayer" controls style="width:100%; margin:10px 0;"></audio>
+
+<!-- Hidden audio element for Methods 1 & 2 -->
+<audio id="hiddenPlayer" playsinline webkit-playsinline></audio>
+
+<h2>Debug Info</h2>
+<div id="debugInfo"></div>
+
+<script>
+var recording = false;
+var recorder = null;
+var audioBlob = null;
+var audioBase64 = null;
+var chunks = [];
+
+// Show debug info
+var info = '';
+info += 'UserAgent: ' + navigator.userAgent + '\n\n';
+info += 'MediaRecorder: ' + (typeof MediaRecorder !== 'undefined' ? 'YES' : 'NO') + '\n';
+if (typeof MediaRecorder !== 'undefined') {
+  ['audio/mp4', 'audio/webm', 'audio/aac', 'audio/ogg', 'audio/wav'].forEach(function(t) {
+    try { info += t + ': ' + (MediaRecorder.isTypeSupported(t) ? 'YES' : 'no') + '\n'; } catch(e) { info += t + ': error\n'; }
+  });
+}
+info += '\nAudioContext: ' + (window.AudioContext || window.webkitAudioContext ? 'YES' : 'NO') + '\n';
+document.getElementById('debugInfo').innerHTML = '<div class="log">' + info.replace(/\n/g, '<br>') + '</div>';
+
+function log(id, msg) {
+  document.getElementById(id).innerHTML += '<div class="log">' + msg + '</div>';
+}
+
+// ── Recording ──
+async function toggleRec() {
+  if (!recording) {
+    try {
+      var stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+      // Find supported type
+      var mimeType = '';
+      ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm', 'audio/aac'].forEach(function(t) {
+        if (!mimeType) { try { if (MediaRecorder.isTypeSupported(t)) mimeType = t; } catch(e) {} }
+      });
+
+      log('recLog', 'Using mime type: ' + (mimeType || 'default'));
+
+      var opts = mimeType ? { mimeType: mimeType } : {};
+      recorder = new MediaRecorder(stream, opts);
+      chunks = [];
+
+      recorder.ondataavailable = function(e) {
+        if (e.data.size > 0) chunks.push(e.data);
+      };
+
+      recorder.onstop = function() {
+        stream.getTracks().forEach(function(t) { t.stop(); });
+        var type = recorder.mimeType || mimeType || 'audio/mp4';
+        audioBlob = new Blob(chunks, { type: type });
+        log('recLog', 'Recorded! Blob size: ' + audioBlob.size + ' bytes, type: ' + audioBlob.type);
+
+        // Also make base64 version
+        var reader = new FileReader();
+        reader.onloadend = function() {
+          audioBase64 = reader.result;
+          log('recLog', 'Base64 ready. Length: ' + audioBase64.length);
+        };
+        reader.readAsDataURL(audioBlob);
+      };
+
+      recorder.start();
+      recording = true;
+      document.getElementById('recBtn').textContent = 'Tap to Stop';
+      document.getElementById('recBtn').classList.add('on');
+      log('recLog', 'Recording started...');
+
+    } catch(e) {
+      log('recLog', 'ERROR: ' + e.message);
+    }
+  } else {
+    recorder.stop();
+    recording = false;
+    document.getElementById('recBtn').textContent = 'Tap to Record';
+    document.getElementById('recBtn').classList.remove('on');
+  }
+}
+
+// ── Method 1: DOM audio element + object URL ──
+function testMethod1() {
+  if (!audioBlob) { log('log1', 'Record something first!'); return; }
+  try {
+    var url = URL.createObjectURL(audioBlob);
+    var el = document.getElementById('hiddenPlayer');
+    el.src = url;
+    log('log1', 'Set src to object URL. Calling load()...');
+    el.load();
+    log('log1', 'Calling play()...');
+    var p = el.play();
+    if (p && p.then) {
+      p.then(function() { log('log1', 'SUCCESS - play() resolved!'); })
+       .catch(function(e) { log('log1', 'FAILED - ' + e.name + ': ' + e.message); });
+    } else {
+      log('log1', 'play() returned no promise (old browser)');
+    }
+  } catch(e) {
+    log('log1', 'ERROR: ' + e.message);
+  }
+}
+
+// ── Method 2: DOM audio element + base64 data URL ──
+function testMethod2() {
+  if (!audioBase64) { log('log2', 'Record something first!'); return; }
+  try {
+    var el = document.getElementById('hiddenPlayer');
+    el.src = audioBase64;
+    log('log2', 'Set src to base64 data URL. Calling load()...');
+    el.load();
+    log('log2', 'Calling play()...');
+    var p = el.play();
+    if (p && p.then) {
+      p.then(function() { log('log2', 'SUCCESS - play() resolved!'); })
+       .catch(function(e) { log('log2', 'FAILED - ' + e.name + ': ' + e.message); });
+    } else {
+      log('log2', 'play() returned no promise');
+    }
+  } catch(e) {
+    log('log2', 'ERROR: ' + e.message);
+  }
+}
+
+// ── Method 3: Web Audio API ──
+function testMethod3() {
+  if (!audioBlob) { log('log3', 'Record something first!'); return; }
+  try {
+    var AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (!AudioCtx) { log('log3', 'No AudioContext!'); return; }
+    var ctx = new AudioCtx();
+    log('log3', 'AudioContext state: ' + ctx.state);
+    if (ctx.state === 'suspended') {
+      ctx.resume().then(function() { log('log3', 'Resumed context, state: ' + ctx.state); });
+    }
+
+    var reader = new FileReader();
+    reader.onloadend = function() {
+      log('log3', 'Got ArrayBuffer, size: ' + reader.result.byteLength + '. Decoding...');
+      ctx.decodeAudioData(reader.result,
+        function(buffer) {
+          log('log3', 'Decoded! Duration: ' + buffer.duration.toFixed(2) + 's. Playing...');
+          var source = ctx.createBufferSource();
+          source.buffer = buffer;
+          source.connect(ctx.destination);
+          source.start(0);
+          source.onended = function() { log('log3', 'Playback ended.'); };
+          log('log3', 'SUCCESS - source.start() called!');
+        },
+        function(e) {
+          log('log3', 'DECODE FAILED: ' + (e ? e.message || e : 'unknown error'));
+        }
+      );
+    };
+    reader.readAsArrayBuffer(audioBlob);
+  } catch(e) {
+    log('log3', 'ERROR: ' + e.message);
+  }
+}
+
+// ── Method 4: Visible audio element with controls ──
+function testMethod4() {
+  if (!audioBlob) { log('log4', 'Record something first!'); return; }
+  try {
+    var url = URL.createObjectURL(audioBlob);
+    var el = document.getElementById('visiblePlayer');
+    el.src = url;
+    el.load();
+    log('log4', 'Set src on visible player. Try pressing the play button on the audio player above.');
+  } catch(e) {
+    log('log4', 'ERROR: ' + e.message);
+  }
+}
+</script>
+</body>
+</html>
