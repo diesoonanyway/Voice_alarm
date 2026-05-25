@@ -134,6 +134,9 @@
   <div id="alarmsList"><div class="empty">No alarms set.</div></div>
 </div>
 
+<!-- Hidden audio element — iOS needs a real DOM element, not new Audio() -->
+<audio id="playerAudio" playsinline webkit-playsinline></audio>
+
 <!-- ALARM POPUP OVERLAY -->
 <div class="alarm-overlay" id="alarmOverlay">
   <div class="alarm-icon">&#128276;</div>
@@ -152,23 +155,22 @@ var recordedChunks = [];
 var isRecording = false;
 var pendingAlarms = [];
 
-// ── iOS Audio Context unlock ──
-var audioCtx = null;
-
-function getAudioCtx() {
-  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-  return audioCtx;
-}
+// ── iOS Audio unlock ──
+// iOS Safari requires the <audio> element to be "activated" by a user gesture.
+// We do this by playing a silent WAV on the first tap, which permanently unlocks it.
+var playerAudio = null;  // set in init
+var audioUnlocked = false;
+var silentWav = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQAAAAA=';
 
 function unlockAudio() {
-  var ctx = getAudioCtx();
-  if (ctx.state === 'suspended') ctx.resume();
-  // Create and play a tiny silent buffer to fully unlock iOS audio
-  var buf = ctx.createBuffer(1, 1, 22050);
-  var src = ctx.createBufferSource();
-  src.buffer = buf;
-  src.connect(ctx.destination);
-  src.start(0);
+  if (audioUnlocked || !playerAudio) return;
+  // Play silent clip to unlock the element for future programmatic playback
+  playerAudio.src = silentWav;
+  playerAudio.load();
+  var p = playerAudio.play();
+  if (p && p.then) {
+    p.then(function() { audioUnlocked = true; }).catch(function() {});
+  }
 }
 
 ['touchstart', 'touchend', 'click'].forEach(function(evt) {
@@ -307,74 +309,40 @@ function stopRecording() {
 }
 
 // ── Playback ──
-// Method 1: HTML5 Audio with object URL (works on most browsers)
-// Method 2: Web Audio API decodeAudioData (fallback for iOS)
+// Use the single <audio> element in the DOM. iOS Safari requires this
+// instead of new Audio(). We set src to a fresh object URL each time,
+// call load(), then play().
+var currentObjUrl = null;
+
 function playClip(name) {
   var blob = clipBlobs[name];
-  if (!blob) return;
+  if (!blob || !playerAudio) return;
 
-  // Always create a fresh object URL — iOS Safari can be picky about reused ones
-  var url = URL.createObjectURL(blob);
-  var audio = new Audio();
-  audio.src = url;
-  audio.setAttribute('playsinline', '');
+  // Revoke previous URL to avoid memory leaks
+  if (currentObjUrl) { URL.revokeObjectURL(currentObjUrl); currentObjUrl = null; }
 
-  var p = audio.play();
+  currentObjUrl = URL.createObjectURL(blob);
+  playerAudio.src = currentObjUrl;
+  playerAudio.load();
+
+  var p = playerAudio.play();
   if (p && p.then) {
-    p.then(function() {
-      audio.onended = function() { URL.revokeObjectURL(url); };
-    }).catch(function() {
-      // HTML5 Audio failed — try Web Audio API
-      URL.revokeObjectURL(url);
-      playClipWebAudio(name);
+    p.catch(function(err) {
+      console.log('Playback failed:', err);
     });
   }
-}
-
-function playClipWebAudio(name) {
-  var blob = clipBlobs[name];
-  if (!blob) return;
-  var ctx = getAudioCtx();
-  var reader = new FileReader();
-  reader.onloadend = function() {
-    ctx.decodeAudioData(reader.result, function(buffer) {
-      var source = ctx.createBufferSource();
-      source.buffer = buffer;
-      source.connect(ctx.destination);
-      source.start(0);
-    }, function() {
-      // decodeAudioData failed too
-      console.log('Could not decode audio');
-    });
-  };
-  reader.readAsArrayBuffer(blob);
 }
 
 // ── Alarm trigger ──
 function triggerAlarm(clipName) {
   if (!clipBlobs[clipName]) return;
 
-  // Try direct playback
-  var url = URL.createObjectURL(clipBlobs[clipName]);
-  var audio = new Audio();
-  audio.src = url;
-
-  var p = audio.play();
-  if (p && p.then) {
-    p.then(function() {
-      audio.onended = function() { URL.revokeObjectURL(url); };
-    }).catch(function() {
-      URL.revokeObjectURL(url);
-      // Audio blocked — show overlay for user to tap
-      showAlarmOverlay(clipName);
-    });
-  } else {
-    // No promise — old browser, show overlay
-    showAlarmOverlay(clipName);
-  }
-
   // Vibrate
   if (navigator.vibrate) navigator.vibrate([300, 100, 300, 100, 300]);
+
+  // On iOS, timer-based playback is always blocked.
+  // Always show the overlay so the user can tap to play.
+  showAlarmOverlay(clipName);
 }
 
 function showAlarmOverlay(clipName) {
@@ -509,6 +477,7 @@ function setStatus(id, msg, cls) {
 
 // ── Init ──
 async function init() {
+  playerAudio = document.getElementById('playerAudio');
   await openDB();
 
   // Load saved clips (stored as Blobs)
