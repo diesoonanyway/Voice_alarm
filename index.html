@@ -51,6 +51,11 @@
   .btn-delete { background: #475569; color: #e2e8f0; }
   .btn-add-alarm { background: #38bdf8; color: #0f172a; width: 100%; padding: 14px; font-size: 1.05rem; }
   .btn-remove { background: #ef4444; color: #fff; font-size: 0.8rem; padding: 6px 12px; }
+  .btn-start {
+    background: #22c55e; color: #fff; width: 100%; padding: 16px;
+    font-size: 1.15rem; margin-top: 10px;
+  }
+  .btn-start.on { background: #ef4444; }
 
   .clip-item, .alarm-item {
     display: flex; align-items: center; justify-content: space-between;
@@ -74,43 +79,25 @@
   .alarm-item .alarm-name { font-size: 0.9rem; font-weight: 600; }
   .alarm-item .alarm-detail { font-size: 0.75rem; color: #94a3b8; }
 
-  /* Alarm overlay */
-  .alarm-overlay {
-    display: none; position: fixed; inset: 0;
-    background: rgba(15,23,42,0.95);
-    z-index: 1000; flex-direction: column;
-    align-items: center; justify-content: center; gap: 16px;
-  }
-  .alarm-overlay.active { display: flex; }
-  .alarm-overlay .alarm-icon { font-size: 4rem; animation: shake 0.4s infinite; }
-  @keyframes shake {
-    0%,100% { transform: rotate(0deg); }
-    25% { transform: rotate(15deg); }
-    75% { transform: rotate(-15deg); }
-  }
-  .alarm-overlay .alarm-label { font-size: 1.4rem; font-weight: 700; color: #38bdf8; text-align: center; padding: 0 20px; }
-  .alarm-overlay .alarm-dismiss {
-    background: #ef4444; color: #fff; padding: 16px 48px;
-    border-radius: 14px; font-size: 1.1rem; font-weight: 700;
-    border: none; cursor: pointer; margin-top: 12px;
-  }
-
-  /* Status bar */
-  .status-bar {
+  /* Running status */
+  .running-bar {
     width: 100%; max-width: 420px; margin-bottom: 16px;
-    background: #1e293b; border-radius: 12px; padding: 14px 16px;
-    display: none; text-align: center;
+    background: #14532d; border: 1px solid #22c55e; border-radius: 12px;
+    padding: 14px 16px; display: none; text-align: center;
   }
-  .status-bar.active { display: block; }
-  .status-bar .sb-status { font-size: 0.85rem; color: #22c55e; }
-  .status-bar .sb-hint { font-size: 0.75rem; color: #64748b; margin-top: 4px; }
+  .running-bar.active { display: block; }
+  .running-bar .rb-status { font-size: 0.95rem; color: #22c55e; font-weight: 600; }
+  .running-bar .rb-next { font-size: 0.8rem; color: #86efac; margin-top: 4px; }
+  .running-bar .rb-hint { font-size: 0.7rem; color: #64748b; margin-top: 6px; }
 
-  /* Keep awake button */
-  .btn-awake {
-    background: #7c3aed; color: #fff; width: 100%; padding: 14px;
-    font-size: 1.05rem; margin-top: 8px;
+  /* Alarm flash */
+  .alarm-flash {
+    display: none; position: fixed; inset: 0;
+    background: rgba(34,197,94,0.15);
+    z-index: 999; pointer-events: none;
   }
-  .btn-awake.on { background: #22c55e; }
+  .alarm-flash.active { display: block; animation: flashBg 1.5s ease-out; }
+  @keyframes flashBg { 0% { background: rgba(34,197,94,0.4); } 100% { background: rgba(34,197,94,0); } }
 </style>
 </head>
 <body>
@@ -118,10 +105,11 @@
 <h1>Voice Alarm</h1>
 <p class="subtitle">Record your voice and set recurring reminders</p>
 
-<!-- STATUS BAR -->
-<div class="status-bar" id="statusBar">
-  <div class="sb-status" id="statusText">&#9989; Alarms running</div>
-  <div class="sb-hint" id="statusHint">Screen will stay on. You can put your phone down.</div>
+<!-- RUNNING STATUS -->
+<div class="running-bar" id="runningBar">
+  <div class="rb-status" id="runningStatus">&#9989; Alarms running</div>
+  <div class="rb-next" id="runningNext"></div>
+  <div class="rb-hint">Keep this page open. Lower your brightness to save battery.</div>
 </div>
 
 <!-- RECORD SECTION -->
@@ -149,36 +137,68 @@
   <input type="number" id="alarmInterval" value="10" min="1" max="1440">
 
   <button class="btn-add-alarm" onclick="addAlarm()">+ Add Alarm</button>
-  <button class="btn-awake" id="awakeBtn" onclick="toggleAwake()">&#128274; Keep Screen Awake</button>
 </div>
 
 <!-- ACTIVE ALARMS -->
 <div class="card">
   <h2>Active Alarms</h2>
   <div id="alarmsList"><div class="empty">No alarms set.</div></div>
+  <button class="btn-start" id="startBtn" onclick="toggleRunning()" style="display:none;">&#9654; Start Alarms</button>
 </div>
 
-<!-- Audio element for manual playback (Play button) -->
+<!-- Audio element for Play button -->
 <audio id="player" playsinline webkit-playsinline></audio>
-<!-- Audio element for alarm playback (separate so they don't conflict) -->
-<audio id="alarmPlayer" playsinline webkit-playsinline></audio>
 
-<!-- ALARM POPUP OVERLAY -->
-<div class="alarm-overlay" id="alarmOverlay">
-  <div class="alarm-icon">&#128276;</div>
-  <div class="alarm-label" id="alarmOverlayLabel">Reminder!</div>
-  <button class="alarm-dismiss" id="alarmDismissBtn">Tap to hear &amp; dismiss</button>
-</div>
+<!-- Invisible video to keep iOS screen awake -->
+<video id="noSleepVideo" playsinline webkit-playsinline loop muted
+  style="position:fixed;top:-1px;left:-1px;width:1px;height:1px;opacity:0.01;"></video>
+
+<!-- Flash overlay when alarm fires -->
+<div class="alarm-flash" id="alarmFlash"></div>
 
 <script>
 // ── State ──
 var clipBlobs = {};
+var clipBuffers = {}; // pre-decoded AudioBuffers for alarm playback
 var alarms = {};
 var alarmCounter = 0;
 var mediaRecorder = null;
 var recordedChunks = [];
 var isRecording = false;
-var pendingAlarms = [];
+var running = false;
+var audioCtx = null;
+var alarmTimestamps = {};
+
+// ── AudioContext (for alarm playback — works from timers on iOS!) ──
+function getAudioCtx() {
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  return audioCtx;
+}
+
+// Pre-decode a clip's blob into an AudioBuffer for instant playback
+function decodeClip(name) {
+  var blob = clipBlobs[name];
+  if (!blob) return;
+  var reader = new FileReader();
+  reader.onloadend = function() {
+    var ctx = getAudioCtx();
+    ctx.decodeAudioData(reader.result.slice(0), function(buffer) {
+      clipBuffers[name] = buffer;
+    }, function() {});
+  };
+  reader.readAsArrayBuffer(blob);
+}
+
+// Play a clip using Web Audio API (works from setInterval on iOS!)
+function playClipWebAudio(name) {
+  var buffer = clipBuffers[name];
+  if (!buffer) return;
+  var ctx = getAudioCtx();
+  var source = ctx.createBufferSource();
+  source.buffer = buffer;
+  source.connect(ctx.destination);
+  source.start(0);
+}
 
 // ── Get supported recording format ──
 function getSupportedMimeType() {
@@ -190,7 +210,7 @@ function getSupportedMimeType() {
   return '';
 }
 
-// ── Playback — uses same pattern as test page Method 1 ──
+// ── Playback for Play button (uses audio element) ──
 function playClip(name) {
   var blob = clipBlobs[name];
   if (!blob) return;
@@ -294,6 +314,7 @@ async function startRecording() {
 
       clipBlobs[name] = blob;
       await dbPut('clips', name, blob);
+      decodeClip(name); // pre-decode for alarm playback
       renderClips();
       setStatus('recordStatus', 'Saved "' + name + '"', 'ok');
       document.getElementById('clipName').value = '';
@@ -316,67 +337,87 @@ function stopRecording() {
   document.getElementById('recordBtn').classList.remove('recording');
 }
 
-// ── Wake Lock (Keep Screen Awake) ──
-var wakeLock = null;
-var awakeOn = false;
-
-async function toggleAwake() {
-  if (!awakeOn) {
-    await startAwake();
-  } else {
-    stopAwake();
-  }
+// ── No-Sleep Video (keeps iOS screen on) ──
+// Creates a tiny blank video that loops, tricking iOS into keeping the screen awake
+function createNoSleepVideo() {
+  // Tiny MP4 video — a single black frame, valid video that iOS will "play"
+  // This is a well-known base64 encoded minimal mp4
+  var noSleepData = 'data:video/mp4;base64,AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDEAAAAIZnJlZQAAAAhtZGF0AAAA1m1vb3YAAABsbXZoZAAAAAAAAAAAAAAAAAAAA+gAAAAAAAEAAAEAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIAAABidWR0YQAAAFptZXRhAAAAAAAAACFoZGxyAAAAAAAAAABtZGlyYXBwbAAAAAAAAAAAAAAAAC1pbHN0AAAAJal0b28AAAAdZGF0YQAAAAEAAAAATGF2ZjU4Ljc2LjEwMA==';
+  return noSleepData;
 }
 
-async function startAwake() {
-  try {
-    // Try the Wake Lock API (works on most modern browsers)
-    if ('wakeLock' in navigator) {
-      wakeLock = await navigator.wakeLock.request('screen');
-      wakeLock.addEventListener('release', function() {
-        // If released (e.g. tab switch), try to re-acquire
-        if (awakeOn) {
-          navigator.wakeLock.request('screen').then(function(wl) { wakeLock = wl; }).catch(function() {});
-        }
-      });
+function startNoSleep() {
+  var video = document.getElementById('noSleepVideo');
+  video.src = createNoSleepVideo();
+  video.load();
+  video.play().catch(function() {});
+}
+
+function stopNoSleep() {
+  var video = document.getElementById('noSleepVideo');
+  video.pause();
+  video.src = '';
+}
+
+// ── Start / Stop alarms ──
+function toggleRunning() {
+  if (!running) startRunning();
+  else stopRunning();
+}
+
+function startRunning() {
+  if (Object.keys(alarms).length === 0) { alert('Add an alarm first.'); return; }
+
+  // Resume AudioContext (MUST be from user gesture for iOS)
+  var ctx = getAudioCtx();
+  if (ctx.state === 'suspended') ctx.resume();
+
+  // Start no-sleep video to keep screen awake
+  startNoSleep();
+
+  // Try Wake Lock API too
+  if ('wakeLock' in navigator) {
+    navigator.wakeLock.request('screen').catch(function() {});
+  }
+
+  // Set alarm timestamps
+  var now = Date.now();
+  for (var id in alarms) {
+    if (!alarmTimestamps[id] || alarmTimestamps[id] < now) {
+      alarmTimestamps[id] = now + (alarms[id].interval * 60 * 1000);
     }
-  } catch(e) {
-    // Wake Lock not supported or failed — screen may still dim
   }
 
-  awakeOn = true;
-  document.getElementById('awakeBtn').textContent = '🔓 Screen Awake — tap to turn off';
-  document.getElementById('awakeBtn').classList.add('on');
-  document.getElementById('statusBar').classList.add('active');
-
-  // Also reduce screen brightness effect by dimming the page after 30s
-  // (saves battery while keeping the screen technically "on")
+  running = true;
+  document.getElementById('startBtn').textContent = '⏹ Stop Alarms';
+  document.getElementById('startBtn').classList.add('on');
+  document.getElementById('runningBar').classList.add('active');
+  updateCountdown();
 }
 
-function stopAwake() {
-  awakeOn = false;
-  if (wakeLock) {
-    wakeLock.release();
-    wakeLock = null;
-  }
-  document.getElementById('awakeBtn').textContent = '🔒 Keep Screen Awake';
-  document.getElementById('awakeBtn').classList.remove('on');
-  if (Object.keys(alarms).length === 0) {
-    document.getElementById('statusBar').classList.remove('active');
-  }
+function stopRunning() {
+  running = false;
+  stopNoSleep();
+  document.getElementById('startBtn').textContent = '▶ Start Alarms';
+  document.getElementById('startBtn').classList.remove('on');
+  document.getElementById('runningBar').classList.remove('active');
 }
 
-// Re-acquire wake lock when page becomes visible again
+// Re-acquire wake lock and resume audio on visibility change
 document.addEventListener('visibilitychange', function() {
-  if (document.visibilityState === 'visible' && awakeOn && 'wakeLock' in navigator) {
-    navigator.wakeLock.request('screen').then(function(wl) { wakeLock = wl; }).catch(function() {});
+  if (document.visibilityState === 'visible' && running) {
+    var ctx = getAudioCtx();
+    if (ctx.state === 'suspended') ctx.resume();
+    startNoSleep();
+    if ('wakeLock' in navigator) {
+      navigator.wakeLock.request('screen').catch(function() {});
+    }
   }
 });
 
-// ── Alarm trigger ──
-var alarmTimestamps = {}; // { id: nextFireTime }
-
+// ── Alarm checker ──
 function checkAlarms() {
+  if (!running) return;
   var now = Date.now();
   for (var id in alarms) {
     if (!alarms.hasOwnProperty(id)) continue;
@@ -386,38 +427,40 @@ function checkAlarms() {
       var interval = alarms[id].interval;
       alarmTimestamps[id] = now + (interval * 60 * 1000);
 
-      // Play the alarm
-      if (clipBlobs[clipName]) {
-        var url = URL.createObjectURL(clipBlobs[clipName]);
-        var ap = document.getElementById('alarmPlayer');
-        ap.src = url;
-        ap.load();
-        var p = ap.play();
-        if (p && p.then) {
-          p.then(function(u) { return function() {
-            ap.onended = function() { URL.revokeObjectURL(u); };
-          }; }(url)).catch(function() {});
-        }
-      }
+      // Play using Web Audio API (works from timers on iOS!)
+      playClipWebAudio(clipName);
+
+      // Visual flash
+      var flash = document.getElementById('alarmFlash');
+      flash.classList.remove('active');
+      void flash.offsetWidth; // force reflow
+      flash.classList.add('active');
+      setTimeout(function() { flash.classList.remove('active'); }, 1500);
+
+      // Vibrate
       if (navigator.vibrate) navigator.vibrate([300, 100, 300, 100, 300]);
     }
   }
+  updateCountdown();
 }
 
 setInterval(checkAlarms, 1000);
 
-function showAlarmOverlay(clipName) {
-  pendingAlarms.push(clipName);
-  document.getElementById('alarmOverlayLabel').textContent = 'Reminder: ' + clipName;
-  document.getElementById('alarmOverlay').classList.add('active');
-}
-
-document.getElementById('alarmDismissBtn').addEventListener('click', function() {
-  while (pendingAlarms.length > 0) {
-    playClip(pendingAlarms.shift());
+// Show countdown to next alarm
+function updateCountdown() {
+  if (!running) return;
+  var now = Date.now();
+  var soonest = Infinity;
+  for (var id in alarmTimestamps) {
+    if (alarmTimestamps[id] < soonest) soonest = alarmTimestamps[id];
   }
-  document.getElementById('alarmOverlay').classList.remove('active');
-});
+  if (soonest < Infinity) {
+    var secs = Math.max(0, Math.ceil((soonest - now) / 1000));
+    var m = Math.floor(secs / 60);
+    var s = secs % 60;
+    document.getElementById('runningNext').textContent = 'Next alarm in ' + m + ':' + (s < 10 ? '0' : '') + s;
+  }
+}
 
 // ── Clips UI ──
 function renderClips() {
@@ -448,6 +491,7 @@ function renderClips() {
 
 async function deleteClip(name) {
   delete clipBlobs[name];
+  delete clipBuffers[name];
   await dbDelete('clips', name);
   renderClips();
 }
@@ -461,14 +505,14 @@ function addAlarm() {
   if (!interval || interval < 1) { alert('Enter a valid interval (1+ minutes).'); return; }
 
   var id = alarmCounter++;
-  var ms = interval * 60 * 1000;
-
   alarms[id] = { clip: clipName, interval: interval };
-  alarmTimestamps[id] = Date.now() + ms; // first fire after one interval
+  alarmTimestamps[id] = Date.now() + (interval * 60 * 1000);
+
+  // Make sure clip is decoded
+  if (!clipBuffers[clipName]) decodeClip(clipName);
 
   saveAlarms();
   renderAlarms();
-  document.getElementById('statusBar').classList.add('active');
 }
 
 function removeAlarm(id) {
@@ -477,19 +521,18 @@ function removeAlarm(id) {
     delete alarmTimestamps[id];
     saveAlarms();
     renderAlarms();
-
-    if (Object.keys(alarms).length === 0 && !awakeOn) {
-      document.getElementById('statusBar').classList.remove('active');
-    }
+    if (Object.keys(alarms).length === 0) stopRunning();
   }
 }
 
 function renderAlarms() {
   var container = document.getElementById('alarmsList');
   var ids = Object.keys(alarms);
+  var btn = document.getElementById('startBtn');
 
   if (ids.length === 0) {
     container.innerHTML = '<div class="empty">No alarms set.</div>';
+    btn.style.display = 'none';
   } else {
     container.innerHTML = ids.map(function(id) {
       var a = alarms[id];
@@ -501,6 +544,7 @@ function renderAlarms() {
         '<button class="btn-remove" onclick="removeAlarm(' + id + ')">Remove</button>' +
         '</div>';
     }).join('');
+    btn.style.display = 'block';
   }
 }
 
@@ -517,20 +561,16 @@ async function saveAlarms() {
 async function loadAlarms() {
   var data = await dbGet('alarms', 'active');
   if (!data) return;
-  var hasAlarms = false;
   for (var id in data) {
     if (!data.hasOwnProperty(id)) continue;
     var a = data[id];
     if (!clipBlobs[a.clip]) continue;
     var numId = parseInt(id);
-    var ms = a.interval * 60 * 1000;
     alarms[numId] = { clip: a.clip, interval: a.interval };
-    alarmTimestamps[numId] = Date.now() + ms;
+    alarmTimestamps[numId] = Date.now() + (a.interval * 60 * 1000);
     if (numId >= alarmCounter) alarmCounter = numId + 1;
-    hasAlarms = true;
   }
   renderAlarms();
-  if (hasAlarms) document.getElementById('statusBar').classList.add('active');
 }
 
 // ── Helpers ──
@@ -552,6 +592,7 @@ async function init() {
       try { var resp = await fetch(blob); blob = await resp.blob(); } catch(e) { continue; }
     }
     clipBlobs[result.keys[i]] = blob;
+    decodeClip(result.keys[i]); // pre-decode for alarm playback
   }
   renderClips();
   await loadAlarms();
