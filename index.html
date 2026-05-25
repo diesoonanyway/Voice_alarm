@@ -74,7 +74,7 @@
   .alarm-item .alarm-name { font-size: 0.9rem; font-weight: 600; }
   .alarm-item .alarm-detail { font-size: 0.75rem; color: #94a3b8; }
 
-  /* Alarm overlay that forces user tap to play on iOS */
+  /* Alarm overlay */
   .alarm-overlay {
     display: none; position: fixed; inset: 0;
     background: rgba(15,23,42,0.95);
@@ -88,7 +88,7 @@
     25% { transform: rotate(15deg); }
     75% { transform: rotate(-15deg); }
   }
-  .alarm-overlay .alarm-label { font-size: 1.4rem; font-weight: 700; color: #38bdf8; }
+  .alarm-overlay .alarm-label { font-size: 1.4rem; font-weight: 700; color: #38bdf8; text-align: center; padding: 0 20px; }
   .alarm-overlay .alarm-dismiss {
     background: #ef4444; color: #fff; padding: 16px 48px;
     border-radius: 14px; font-size: 1.1rem; font-weight: 700;
@@ -134,7 +134,7 @@
   <div id="alarmsList"><div class="empty">No alarms set.</div></div>
 </div>
 
-<!-- ALARM POPUP OVERLAY (for iOS — audio must play from a user tap) -->
+<!-- ALARM POPUP OVERLAY -->
 <div class="alarm-overlay" id="alarmOverlay">
   <div class="alarm-icon">&#128276;</div>
   <div class="alarm-label" id="alarmOverlayLabel">Reminder!</div>
@@ -143,111 +143,111 @@
 
 <script>
 // ── State ──
-let clips = {};       // { name: base64DataUrl }
-let alarms = {};      // { id: { clip, interval, timerId } }
-let alarmCounter = 0;
-let mediaRecorder = null;
-let recordedChunks = [];
-let isRecording = false;
+var clipBlobs = {};   // { name: Blob }
+var clipURLs = {};    // { name: objectURL } — for playback
+var alarms = {};      // { id: { clip, interval, timerId } }
+var alarmCounter = 0;
+var mediaRecorder = null;
+var recordedChunks = [];
+var isRecording = false;
+var pendingAlarms = [];
 
-// Queue of pending alarm clip names to play
-let pendingAlarms = [];
+// ── iOS Audio Context unlock ──
+var audioCtx = null;
 
-// ── iOS audio unlock ──
-// iOS Safari requires an AudioContext to be resumed from a user gesture.
-// We also keep a shared Audio element that gets "unlocked" on first tap.
-let audioCtx = null;
-let audioUnlocked = false;
-
-function unlockAudio() {
-  if (audioUnlocked) return;
-  // Create AudioContext and resume it
+function getAudioCtx() {
   if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-  if (audioCtx.state === 'suspended') audioCtx.resume();
-  // Play a silent buffer to unlock HTML5 Audio on iOS
-  const silentAudio = new Audio('data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQAAAAA=');
-  silentAudio.play().then(() => { silentAudio.pause(); }).catch(() => {});
-  audioUnlocked = true;
+  return audioCtx;
 }
 
-// Unlock on any user interaction
-['touchstart', 'touchend', 'click', 'keydown'].forEach(evt => {
-  document.addEventListener(evt, unlockAudio, { once: false, passive: true });
+function unlockAudio() {
+  var ctx = getAudioCtx();
+  if (ctx.state === 'suspended') ctx.resume();
+  // Create and play a tiny silent buffer to fully unlock iOS audio
+  var buf = ctx.createBuffer(1, 1, 22050);
+  var src = ctx.createBufferSource();
+  src.buffer = buf;
+  src.connect(ctx.destination);
+  src.start(0);
+}
+
+['touchstart', 'touchend', 'click'].forEach(function(evt) {
+  document.addEventListener(evt, unlockAudio, { passive: true });
 });
 
 // ── Detect best recording format ──
 function getSupportedMimeType() {
-  const types = [
+  if (typeof MediaRecorder === 'undefined') return '';
+  var types = [
+    'audio/mp4',
     'audio/webm;codecs=opus',
     'audio/webm',
-    'audio/mp4',
     'audio/aac',
-    'audio/ogg;codecs=opus',
-    ''  // fallback: let browser pick
+    'audio/ogg;codecs=opus'
   ];
-  for (const t of types) {
-    if (t === '' || (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(t))) return t;
+  for (var i = 0; i < types.length; i++) {
+    try { if (MediaRecorder.isTypeSupported(types[i])) return types[i]; } catch(e) {}
   }
   return '';
 }
 
-// ── Persistence (IndexedDB) ──
-const DB_NAME = 'VoiceAlarmDB';
-const DB_VERSION = 1;
-let db = null;
+// ── Persistence (IndexedDB) — stores Blobs directly ──
+var DB_NAME = 'VoiceAlarmDB2';
+var DB_VERSION = 1;
+var db = null;
 
 function openDB() {
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, DB_VERSION);
-    req.onupgradeneeded = e => {
-      const d = e.target.result;
+  return new Promise(function(resolve, reject) {
+    var req = indexedDB.open(DB_NAME, DB_VERSION);
+    req.onupgradeneeded = function(e) {
+      var d = e.target.result;
       if (!d.objectStoreNames.contains('clips')) d.createObjectStore('clips');
       if (!d.objectStoreNames.contains('alarms')) d.createObjectStore('alarms');
     };
-    req.onsuccess = e => { db = e.target.result; resolve(db); };
-    req.onerror = e => reject(e);
+    req.onsuccess = function(e) { db = e.target.result; resolve(db); };
+    req.onerror = function(e) { reject(e); };
   });
 }
 
 function dbPut(store, key, val) {
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(store, 'readwrite');
+  return new Promise(function(resolve, reject) {
+    var tx = db.transaction(store, 'readwrite');
     tx.objectStore(store).put(val, key);
-    tx.oncomplete = () => resolve();
-    tx.onerror = e => reject(e);
+    tx.oncomplete = function() { resolve(); };
+    tx.onerror = function(e) { reject(e); };
   });
 }
 
 function dbGet(store, key) {
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(store, 'readonly');
-    const req = tx.objectStore(store).get(key);
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = e => reject(e);
+  return new Promise(function(resolve, reject) {
+    var tx = db.transaction(store, 'readonly');
+    var req = tx.objectStore(store).get(key);
+    req.onsuccess = function() { resolve(req.result); };
+    req.onerror = function(e) { reject(e); };
   });
 }
 
 function dbDelete(store, key) {
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(store, 'readwrite');
+  return new Promise(function(resolve, reject) {
+    var tx = db.transaction(store, 'readwrite');
     tx.objectStore(store).delete(key);
-    tx.oncomplete = () => resolve();
-    tx.onerror = e => reject(e);
+    tx.oncomplete = function() { resolve(); };
+    tx.onerror = function(e) { reject(e); };
   });
 }
 
 function dbGetAll(store) {
-  return new Promise((resolve, reject) => {
-    const tx = db.transaction(store, 'readonly');
-    const s = tx.objectStore(store);
-    const keys = []; const vals = [];
-    const req = s.openCursor();
-    req.onsuccess = e => {
-      const c = e.target.result;
+  return new Promise(function(resolve, reject) {
+    var tx = db.transaction(store, 'readonly');
+    var s = tx.objectStore(store);
+    var keys = []; var vals = [];
+    var req = s.openCursor();
+    req.onsuccess = function(e) {
+      var c = e.target.result;
       if (c) { keys.push(c.key); vals.push(c.value); c.continue(); }
-      else resolve({ keys, vals });
+      else resolve({ keys: keys, vals: vals });
     };
-    req.onerror = e => reject(e);
+    req.onerror = function(e) { reject(e); };
   });
 }
 
@@ -258,29 +258,36 @@ async function toggleRecord() {
 }
 
 async function startRecording() {
-  const name = document.getElementById('clipName').value.trim();
+  var name = document.getElementById('clipName').value.trim();
   if (!name) { setStatus('recordStatus', 'Enter a clip name first.', 'err'); return; }
 
+  // Unlock audio context on this user gesture
+  unlockAudio();
+
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    const mimeType = getSupportedMimeType();
-    const options = mimeType ? { mimeType } : {};
+    var stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    var mimeType = getSupportedMimeType();
+    var options = mimeType ? { mimeType: mimeType } : {};
     mediaRecorder = new MediaRecorder(stream, options);
     recordedChunks = [];
-    mediaRecorder.ondataavailable = e => { if (e.data.size > 0) recordedChunks.push(e.data); };
-    mediaRecorder.onstop = async () => {
-      stream.getTracks().forEach(t => t.stop());
-      const usedType = mediaRecorder.mimeType || 'audio/wav';
-      const blob = new Blob(recordedChunks, { type: usedType });
-      const reader = new FileReader();
-      reader.onloadend = async () => {
-        clips[name] = reader.result;
-        await dbPut('clips', name, reader.result);
-        renderClips();
-        setStatus('recordStatus', 'Saved "' + name + '"', 'ok');
-        document.getElementById('clipName').value = '';
-      };
-      reader.readAsDataURL(blob);
+    mediaRecorder.ondataavailable = function(e) { if (e.data.size > 0) recordedChunks.push(e.data); };
+    mediaRecorder.onstop = async function() {
+      stream.getTracks().forEach(function(t) { t.stop(); });
+      var usedType = mediaRecorder.mimeType || 'audio/mp4';
+      var blob = new Blob(recordedChunks, { type: usedType });
+
+      // Store the blob
+      clipBlobs[name] = blob;
+      // Revoke old URL if exists
+      if (clipURLs[name]) URL.revokeObjectURL(clipURLs[name]);
+      clipURLs[name] = URL.createObjectURL(blob);
+
+      // Save blob to IndexedDB
+      await dbPut('clips', name, blob);
+
+      renderClips();
+      setStatus('recordStatus', 'Saved "' + name + '"', 'ok');
+      document.getElementById('clipName').value = '';
     };
     mediaRecorder.start();
     isRecording = true;
@@ -288,7 +295,7 @@ async function startRecording() {
     document.getElementById('recordBtn').classList.add('recording');
     setStatus('recordStatus', 'Recording... speak now!', 'info');
   } catch (err) {
-    setStatus('recordStatus', 'Mic access denied. Allow microphone in your browser settings.', 'err');
+    setStatus('recordStatus', 'Mic access denied. Allow microphone.', 'err');
   }
 }
 
@@ -300,66 +307,101 @@ function stopRecording() {
 }
 
 // ── Playback ──
+// Method 1: HTML5 Audio with object URL (works on most browsers)
+// Method 2: Web Audio API decodeAudioData (fallback for iOS)
 function playClip(name) {
-  const data = clips[name];
-  if (!data) return;
-  const audio = new Audio(data);
-  audio.setAttribute('playsinline', '');
-  const p = audio.play();
-  if (p && p.catch) p.catch(() => {});
-}
+  var blob = clipBlobs[name];
+  if (!blob) return;
 
-// ── Alarm trigger ──
-// On desktop/Android, we try to play directly.
-// On iOS, audio.play() from a timer is blocked, so we show a fullscreen
-// overlay that the user taps — the tap is a user gesture so audio plays.
-function triggerAlarm(clipName) {
-  const data = clips[clipName];
-  if (!data) return;
-
-  // Try direct playback first (works on desktop & Android)
-  const audio = new Audio(data);
+  // Always create a fresh object URL — iOS Safari can be picky about reused ones
+  var url = URL.createObjectURL(blob);
+  var audio = new Audio();
+  audio.src = url;
   audio.setAttribute('playsinline', '');
-  const p = audio.play();
+
+  var p = audio.play();
   if (p && p.then) {
-    p.then(() => {
-      // Worked! No overlay needed.
-    }).catch(() => {
-      // Blocked (iOS timer context). Show overlay so user can tap.
-      showAlarmOverlay(clipName);
+    p.then(function() {
+      audio.onended = function() { URL.revokeObjectURL(url); };
+    }).catch(function() {
+      // HTML5 Audio failed — try Web Audio API
+      URL.revokeObjectURL(url);
+      playClipWebAudio(name);
     });
   }
 }
 
+function playClipWebAudio(name) {
+  var blob = clipBlobs[name];
+  if (!blob) return;
+  var ctx = getAudioCtx();
+  var reader = new FileReader();
+  reader.onloadend = function() {
+    ctx.decodeAudioData(reader.result, function(buffer) {
+      var source = ctx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(ctx.destination);
+      source.start(0);
+    }, function() {
+      // decodeAudioData failed too
+      console.log('Could not decode audio');
+    });
+  };
+  reader.readAsArrayBuffer(blob);
+}
+
+// ── Alarm trigger ──
+function triggerAlarm(clipName) {
+  if (!clipBlobs[clipName]) return;
+
+  // Try direct playback
+  var url = URL.createObjectURL(clipBlobs[clipName]);
+  var audio = new Audio();
+  audio.src = url;
+
+  var p = audio.play();
+  if (p && p.then) {
+    p.then(function() {
+      audio.onended = function() { URL.revokeObjectURL(url); };
+    }).catch(function() {
+      URL.revokeObjectURL(url);
+      // Audio blocked — show overlay for user to tap
+      showAlarmOverlay(clipName);
+    });
+  } else {
+    // No promise — old browser, show overlay
+    showAlarmOverlay(clipName);
+  }
+
+  // Vibrate
+  if (navigator.vibrate) navigator.vibrate([300, 100, 300, 100, 300]);
+}
+
 function showAlarmOverlay(clipName) {
   pendingAlarms.push(clipName);
-  const overlay = document.getElementById('alarmOverlay');
   document.getElementById('alarmOverlayLabel').textContent = 'Reminder: ' + clipName;
-  overlay.classList.add('active');
-
-  // Also vibrate if supported
+  document.getElementById('alarmOverlay').classList.add('active');
   if (navigator.vibrate) navigator.vibrate([300, 100, 300, 100, 300]);
 }
 
 document.getElementById('alarmDismissBtn').addEventListener('click', function() {
-  // User tapped — this is a user gesture, so audio will play on iOS
+  // User tap = user gesture, audio will play on iOS
   while (pendingAlarms.length > 0) {
-    const name = pendingAlarms.shift();
-    playClip(name);
+    playClip(pendingAlarms.shift());
   }
   document.getElementById('alarmOverlay').classList.remove('active');
 });
 
 // ── Clips UI ──
 function renderClips() {
-  const container = document.getElementById('clipsList');
-  const names = Object.keys(clips).sort();
+  var container = document.getElementById('clipsList');
+  var names = Object.keys(clipBlobs).sort();
 
   if (names.length === 0) {
     container.innerHTML = '<div class="empty">No clips yet. Record one above!</div>';
   } else {
-    container.innerHTML = names.map(n => {
-      const escaped = esc(n);
+    container.innerHTML = names.map(function(n) {
+      var escaped = esc(n);
       return '<div class="clip-item">' +
         '<span>' + escaped + '</span>' +
         '<div class="clip-actions">' +
@@ -369,35 +411,35 @@ function renderClips() {
     }).join('');
   }
 
-  // Update alarm dropdown
-  const select = document.getElementById('alarmClip');
-  const prev = select.value;
+  var select = document.getElementById('alarmClip');
+  var prev = select.value;
   select.innerHTML = names.length
-    ? names.map(n => '<option value="' + esc(n) + '">' + esc(n) + '</option>').join('')
+    ? names.map(function(n) { return '<option value="' + esc(n) + '">' + esc(n) + '</option>'; }).join('')
     : '<option value="">-- record a clip first --</option>';
   if (prev && names.includes(prev)) select.value = prev;
 }
 
 async function deleteClip(name) {
-  delete clips[name];
+  if (clipURLs[name]) URL.revokeObjectURL(clipURLs[name]);
+  delete clipBlobs[name];
+  delete clipURLs[name];
   await dbDelete('clips', name);
   renderClips();
 }
 
 // ── Alarms ──
 function addAlarm() {
-  const clipName = document.getElementById('alarmClip').value;
-  if (!clipName || !clips[clipName]) { alert('Select a voice clip first.'); return; }
+  var clipName = document.getElementById('alarmClip').value;
+  if (!clipName || !clipBlobs[clipName]) { alert('Select a voice clip first.'); return; }
 
-  const interval = parseInt(document.getElementById('alarmInterval').value);
+  var interval = parseInt(document.getElementById('alarmInterval').value);
   if (!interval || interval < 1) { alert('Enter a valid interval (1+ minutes).'); return; }
 
-  const id = alarmCounter++;
-  const ms = interval * 60 * 1000;
+  var id = alarmCounter++;
+  var ms = interval * 60 * 1000;
+  var timerId = setInterval(function() { triggerAlarm(clipName); }, ms);
 
-  const timerId = setInterval(() => triggerAlarm(clipName), ms);
-
-  alarms[id] = { clip: clipName, interval, timerId };
+  alarms[id] = { clip: clipName, interval: interval, timerId: timerId };
   saveAlarms();
   renderAlarms();
 }
@@ -412,14 +454,14 @@ function removeAlarm(id) {
 }
 
 function renderAlarms() {
-  const container = document.getElementById('alarmsList');
-  const ids = Object.keys(alarms);
+  var container = document.getElementById('alarmsList');
+  var ids = Object.keys(alarms);
 
   if (ids.length === 0) {
     container.innerHTML = '<div class="empty">No alarms set.</div>';
   } else {
-    container.innerHTML = ids.map(id => {
-      const a = alarms[id];
+    container.innerHTML = ids.map(function(id) {
+      var a = alarms[id];
       return '<div class="alarm-item">' +
         '<div class="alarm-info">' +
         '<div class="alarm-name">"' + esc(a.clip) + '"</div>' +
@@ -432,22 +474,26 @@ function renderAlarms() {
 }
 
 async function saveAlarms() {
-  const data = {};
-  for (const [id, a] of Object.entries(alarms)) {
-    data[id] = { clip: a.clip, interval: a.interval };
+  var data = {};
+  for (var id in alarms) {
+    if (alarms.hasOwnProperty(id)) {
+      data[id] = { clip: alarms[id].clip, interval: alarms[id].interval };
+    }
   }
   await dbPut('alarms', 'active', data);
 }
 
 async function loadAlarms() {
-  const data = await dbGet('alarms', 'active');
+  var data = await dbGet('alarms', 'active');
   if (!data) return;
-  for (const [id, a] of Object.entries(data)) {
-    if (!clips[a.clip]) continue;
-    const numId = parseInt(id);
-    const ms = a.interval * 60 * 1000;
-    const timerId = setInterval(() => triggerAlarm(a.clip), ms);
-    alarms[numId] = { clip: a.clip, interval: a.interval, timerId };
+  for (var id in data) {
+    if (!data.hasOwnProperty(id)) continue;
+    var a = data[id];
+    if (!clipBlobs[a.clip]) continue;
+    var numId = parseInt(id);
+    var ms = a.interval * 60 * 1000;
+    var timerId = setInterval((function(clip) { return function() { triggerAlarm(clip); }; })(a.clip), ms);
+    alarms[numId] = { clip: a.clip, interval: a.interval, timerId: timerId };
     if (numId >= alarmCounter) alarmCounter = numId + 1;
   }
   renderAlarms();
@@ -465,12 +511,23 @@ function setStatus(id, msg, cls) {
 async function init() {
   await openDB();
 
-  // Load saved clips
-  const { keys, vals } = await dbGetAll('clips');
-  for (let i = 0; i < keys.length; i++) clips[keys[i]] = vals[i];
+  // Load saved clips (stored as Blobs)
+  var result = await dbGetAll('clips');
+  for (var i = 0; i < result.keys.length; i++) {
+    var name = result.keys[i];
+    var blob = result.vals[i];
+    // If it's a Blob, use directly. If it's a string (old format), convert.
+    if (typeof blob === 'string') {
+      // Convert old data URL to blob
+      try {
+        var resp = await fetch(blob);
+        blob = await resp.blob();
+      } catch(e) { continue; }
+    }
+    clipBlobs[name] = blob;
+    clipURLs[name] = URL.createObjectURL(blob);
+  }
   renderClips();
-
-  // Restore alarms
   await loadAlarms();
 }
 
