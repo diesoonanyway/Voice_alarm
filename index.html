@@ -134,8 +134,8 @@
   <div id="alarmsList"><div class="empty">No alarms set.</div></div>
 </div>
 
-<!-- Hidden audio element — iOS needs a real DOM element, not new Audio() -->
-<audio id="playerAudio" playsinline webkit-playsinline></audio>
+<!-- Audio element for playback -->
+<audio id="player" playsinline webkit-playsinline></audio>
 
 <!-- ALARM POPUP OVERLAY -->
 <div class="alarm-overlay" id="alarmOverlay">
@@ -146,55 +146,42 @@
 
 <script>
 // ── State ──
-var clipBlobs = {};   // { name: Blob }
-var clipURLs = {};    // { name: objectURL } — for playback
-var alarms = {};      // { id: { clip, interval, timerId } }
+var clipBlobs = {};
+var alarms = {};
 var alarmCounter = 0;
 var mediaRecorder = null;
 var recordedChunks = [];
 var isRecording = false;
 var pendingAlarms = [];
 
-// ── iOS Audio unlock ──
-// iOS Safari requires the <audio> element to be "activated" by a user gesture.
-// We do this by playing a silent WAV on the first tap, which permanently unlocks it.
-var playerAudio = null;  // set in init
-var audioUnlocked = false;
-var silentWav = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQAAAAA=';
-
-function unlockAudio() {
-  if (audioUnlocked || !playerAudio) return;
-  // Play silent clip to unlock the element for future programmatic playback
-  playerAudio.src = silentWav;
-  playerAudio.load();
-  var p = playerAudio.play();
-  if (p && p.then) {
-    p.then(function() { audioUnlocked = true; }).catch(function() {});
-  }
-}
-
-['touchstart', 'touchend', 'click'].forEach(function(evt) {
-  document.addEventListener(evt, unlockAudio, { passive: true });
-});
-
-// ── Detect best recording format ──
+// ── Get supported recording format ──
 function getSupportedMimeType() {
   if (typeof MediaRecorder === 'undefined') return '';
-  var types = [
-    'audio/mp4',
-    'audio/webm;codecs=opus',
-    'audio/webm',
-    'audio/aac',
-    'audio/ogg;codecs=opus'
-  ];
+  var types = ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm', 'audio/aac', 'audio/ogg;codecs=opus'];
   for (var i = 0; i < types.length; i++) {
     try { if (MediaRecorder.isTypeSupported(types[i])) return types[i]; } catch(e) {}
   }
   return '';
 }
 
-// ── Persistence (IndexedDB) — stores Blobs directly ──
-var DB_NAME = 'VoiceAlarmDB2';
+// ── Playback — uses same pattern as test page Method 1 ──
+function playClip(name) {
+  var blob = clipBlobs[name];
+  if (!blob) return;
+  var url = URL.createObjectURL(blob);
+  var audio = document.getElementById('player');
+  audio.src = url;
+  audio.load();
+  var p = audio.play();
+  if (p && p.then) {
+    p.then(function() {
+      audio.onended = function() { URL.revokeObjectURL(url); };
+    }).catch(function() {});
+  }
+}
+
+// ── Persistence (IndexedDB) ──
+var DB_NAME = 'VoiceAlarmDB3';
 var DB_VERSION = 1;
 var db = null;
 
@@ -263,34 +250,29 @@ async function startRecording() {
   var name = document.getElementById('clipName').value.trim();
   if (!name) { setStatus('recordStatus', 'Enter a clip name first.', 'err'); return; }
 
-  // Unlock audio context on this user gesture
-  unlockAudio();
-
   try {
     var stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     var mimeType = getSupportedMimeType();
     var options = mimeType ? { mimeType: mimeType } : {};
     mediaRecorder = new MediaRecorder(stream, options);
     recordedChunks = [];
-    mediaRecorder.ondataavailable = function(e) { if (e.data.size > 0) recordedChunks.push(e.data); };
+
+    mediaRecorder.ondataavailable = function(e) {
+      if (e.data.size > 0) recordedChunks.push(e.data);
+    };
+
     mediaRecorder.onstop = async function() {
       stream.getTracks().forEach(function(t) { t.stop(); });
-      var usedType = mediaRecorder.mimeType || 'audio/mp4';
-      var blob = new Blob(recordedChunks, { type: usedType });
+      var type = mediaRecorder.mimeType || mimeType || 'audio/mp4';
+      var blob = new Blob(recordedChunks, { type: type });
 
-      // Store the blob
       clipBlobs[name] = blob;
-      // Revoke old URL if exists
-      if (clipURLs[name]) URL.revokeObjectURL(clipURLs[name]);
-      clipURLs[name] = URL.createObjectURL(blob);
-
-      // Save blob to IndexedDB
       await dbPut('clips', name, blob);
-
       renderClips();
       setStatus('recordStatus', 'Saved "' + name + '"', 'ok');
       document.getElementById('clipName').value = '';
     };
+
     mediaRecorder.start();
     isRecording = true;
     document.getElementById('recordBtn').textContent = 'Stop';
@@ -308,40 +290,10 @@ function stopRecording() {
   document.getElementById('recordBtn').classList.remove('recording');
 }
 
-// ── Playback ──
-// Use the single <audio> element in the DOM. iOS Safari requires this
-// instead of new Audio(). We set src to a fresh object URL each time,
-// call load(), then play().
-var currentObjUrl = null;
-
-function playClip(name) {
-  var blob = clipBlobs[name];
-  if (!blob || !playerAudio) return;
-
-  // Revoke previous URL to avoid memory leaks
-  if (currentObjUrl) { URL.revokeObjectURL(currentObjUrl); currentObjUrl = null; }
-
-  currentObjUrl = URL.createObjectURL(blob);
-  playerAudio.src = currentObjUrl;
-  playerAudio.load();
-
-  var p = playerAudio.play();
-  if (p && p.then) {
-    p.catch(function(err) {
-      console.log('Playback failed:', err);
-    });
-  }
-}
-
 // ── Alarm trigger ──
 function triggerAlarm(clipName) {
   if (!clipBlobs[clipName]) return;
-
-  // Vibrate
   if (navigator.vibrate) navigator.vibrate([300, 100, 300, 100, 300]);
-
-  // On iOS, timer-based playback is always blocked.
-  // Always show the overlay so the user can tap to play.
   showAlarmOverlay(clipName);
 }
 
@@ -349,11 +301,10 @@ function showAlarmOverlay(clipName) {
   pendingAlarms.push(clipName);
   document.getElementById('alarmOverlayLabel').textContent = 'Reminder: ' + clipName;
   document.getElementById('alarmOverlay').classList.add('active');
-  if (navigator.vibrate) navigator.vibrate([300, 100, 300, 100, 300]);
 }
 
 document.getElementById('alarmDismissBtn').addEventListener('click', function() {
-  // User tap = user gesture, audio will play on iOS
+  // User tap = user gesture, audio plays on iOS
   while (pendingAlarms.length > 0) {
     playClip(pendingAlarms.shift());
   }
@@ -388,9 +339,7 @@ function renderClips() {
 }
 
 async function deleteClip(name) {
-  if (clipURLs[name]) URL.revokeObjectURL(clipURLs[name]);
   delete clipBlobs[name];
-  delete clipURLs[name];
   await dbDelete('clips', name);
   renderClips();
 }
@@ -477,24 +426,15 @@ function setStatus(id, msg, cls) {
 
 // ── Init ──
 async function init() {
-  playerAudio = document.getElementById('playerAudio');
   await openDB();
 
-  // Load saved clips (stored as Blobs)
   var result = await dbGetAll('clips');
   for (var i = 0; i < result.keys.length; i++) {
-    var name = result.keys[i];
     var blob = result.vals[i];
-    // If it's a Blob, use directly. If it's a string (old format), convert.
     if (typeof blob === 'string') {
-      // Convert old data URL to blob
-      try {
-        var resp = await fetch(blob);
-        blob = await resp.blob();
-      } catch(e) { continue; }
+      try { var resp = await fetch(blob); blob = await resp.blob(); } catch(e) { continue; }
     }
-    clipBlobs[name] = blob;
-    clipURLs[name] = URL.createObjectURL(blob);
+    clipBlobs[result.keys[i]] = blob;
   }
   renderClips();
   await loadAlarms();
