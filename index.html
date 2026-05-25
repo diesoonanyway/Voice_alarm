@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
 <title>Voice Alarm</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -34,7 +34,6 @@
     width: 100%; padding: 10px 12px; border-radius: 10px;
     border: 1px solid #334155; background: #0f172a; color: #e2e8f0;
     font-size: 1rem; margin-bottom: 12px; outline: none;
-    appearance: none;
   }
 
   button {
@@ -74,6 +73,27 @@
   .alarm-item .alarm-info { flex: 1; }
   .alarm-item .alarm-name { font-size: 0.9rem; font-weight: 600; }
   .alarm-item .alarm-detail { font-size: 0.75rem; color: #94a3b8; }
+
+  /* Alarm overlay that forces user tap to play on iOS */
+  .alarm-overlay {
+    display: none; position: fixed; inset: 0;
+    background: rgba(15,23,42,0.95);
+    z-index: 1000; flex-direction: column;
+    align-items: center; justify-content: center; gap: 16px;
+  }
+  .alarm-overlay.active { display: flex; }
+  .alarm-overlay .alarm-icon { font-size: 4rem; animation: shake 0.4s infinite; }
+  @keyframes shake {
+    0%,100% { transform: rotate(0deg); }
+    25% { transform: rotate(15deg); }
+    75% { transform: rotate(-15deg); }
+  }
+  .alarm-overlay .alarm-label { font-size: 1.4rem; font-weight: 700; color: #38bdf8; }
+  .alarm-overlay .alarm-dismiss {
+    background: #ef4444; color: #fff; padding: 16px 48px;
+    border-radius: 14px; font-size: 1.1rem; font-weight: 700;
+    border: none; cursor: pointer; margin-top: 12px;
+  }
 </style>
 </head>
 <body>
@@ -114,14 +134,62 @@
   <div id="alarmsList"><div class="empty">No alarms set.</div></div>
 </div>
 
+<!-- ALARM POPUP OVERLAY (for iOS — audio must play from a user tap) -->
+<div class="alarm-overlay" id="alarmOverlay">
+  <div class="alarm-icon">&#128276;</div>
+  <div class="alarm-label" id="alarmOverlayLabel">Reminder!</div>
+  <button class="alarm-dismiss" id="alarmDismissBtn">Tap to hear &amp; dismiss</button>
+</div>
+
 <script>
 // ── State ──
 let clips = {};       // { name: base64DataUrl }
-let alarms = {};      // { id: { clip, interval, timerId, name } }
+let alarms = {};      // { id: { clip, interval, timerId } }
 let alarmCounter = 0;
 let mediaRecorder = null;
 let recordedChunks = [];
 let isRecording = false;
+
+// Queue of pending alarm clip names to play
+let pendingAlarms = [];
+
+// ── iOS audio unlock ──
+// iOS Safari requires an AudioContext to be resumed from a user gesture.
+// We also keep a shared Audio element that gets "unlocked" on first tap.
+let audioCtx = null;
+let audioUnlocked = false;
+
+function unlockAudio() {
+  if (audioUnlocked) return;
+  // Create AudioContext and resume it
+  if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+  // Play a silent buffer to unlock HTML5 Audio on iOS
+  const silentAudio = new Audio('data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQAAAAA=');
+  silentAudio.play().then(() => { silentAudio.pause(); }).catch(() => {});
+  audioUnlocked = true;
+}
+
+// Unlock on any user interaction
+['touchstart', 'touchend', 'click', 'keydown'].forEach(evt => {
+  document.addEventListener(evt, unlockAudio, { once: false, passive: true });
+});
+
+// ── Detect best recording format ──
+function getSupportedMimeType() {
+  const types = [
+    'audio/webm;codecs=opus',
+    'audio/webm',
+    'audio/mp4',
+    'audio/aac',
+    'audio/ogg;codecs=opus',
+    ''  // fallback: let browser pick
+  ];
+  for (const t of types) {
+    if (t === '' || (typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported(t))) return t;
+  }
+  return '';
+}
 
 // ── Persistence (IndexedDB) ──
 const DB_NAME = 'VoiceAlarmDB';
@@ -195,18 +263,21 @@ async function startRecording() {
 
   try {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    mediaRecorder = new MediaRecorder(stream);
+    const mimeType = getSupportedMimeType();
+    const options = mimeType ? { mimeType } : {};
+    mediaRecorder = new MediaRecorder(stream, options);
     recordedChunks = [];
     mediaRecorder.ondataavailable = e => { if (e.data.size > 0) recordedChunks.push(e.data); };
     mediaRecorder.onstop = async () => {
       stream.getTracks().forEach(t => t.stop());
-      const blob = new Blob(recordedChunks, { type: 'audio/webm' });
+      const usedType = mediaRecorder.mimeType || 'audio/wav';
+      const blob = new Blob(recordedChunks, { type: usedType });
       const reader = new FileReader();
       reader.onloadend = async () => {
         clips[name] = reader.result;
         await dbPut('clips', name, reader.result);
         renderClips();
-        setStatus('recordStatus', `Saved "${name}"`, 'ok');
+        setStatus('recordStatus', 'Saved "' + name + '"', 'ok');
         document.getElementById('clipName').value = '';
       };
       reader.readAsDataURL(blob);
@@ -217,7 +288,7 @@ async function startRecording() {
     document.getElementById('recordBtn').classList.add('recording');
     setStatus('recordStatus', 'Recording... speak now!', 'info');
   } catch (err) {
-    setStatus('recordStatus', 'Mic access denied. Allow microphone.', 'err');
+    setStatus('recordStatus', 'Mic access denied. Allow microphone in your browser settings.', 'err');
   }
 }
 
@@ -233,8 +304,51 @@ function playClip(name) {
   const data = clips[name];
   if (!data) return;
   const audio = new Audio(data);
-  audio.play();
+  audio.setAttribute('playsinline', '');
+  const p = audio.play();
+  if (p && p.catch) p.catch(() => {});
 }
+
+// ── Alarm trigger ──
+// On desktop/Android, we try to play directly.
+// On iOS, audio.play() from a timer is blocked, so we show a fullscreen
+// overlay that the user taps — the tap is a user gesture so audio plays.
+function triggerAlarm(clipName) {
+  const data = clips[clipName];
+  if (!data) return;
+
+  // Try direct playback first (works on desktop & Android)
+  const audio = new Audio(data);
+  audio.setAttribute('playsinline', '');
+  const p = audio.play();
+  if (p && p.then) {
+    p.then(() => {
+      // Worked! No overlay needed.
+    }).catch(() => {
+      // Blocked (iOS timer context). Show overlay so user can tap.
+      showAlarmOverlay(clipName);
+    });
+  }
+}
+
+function showAlarmOverlay(clipName) {
+  pendingAlarms.push(clipName);
+  const overlay = document.getElementById('alarmOverlay');
+  document.getElementById('alarmOverlayLabel').textContent = 'Reminder: ' + clipName;
+  overlay.classList.add('active');
+
+  // Also vibrate if supported
+  if (navigator.vibrate) navigator.vibrate([300, 100, 300, 100, 300]);
+}
+
+document.getElementById('alarmDismissBtn').addEventListener('click', function() {
+  // User tapped — this is a user gesture, so audio will play on iOS
+  while (pendingAlarms.length > 0) {
+    const name = pendingAlarms.shift();
+    playClip(name);
+  }
+  document.getElementById('alarmOverlay').classList.remove('active');
+});
 
 // ── Clips UI ──
 function renderClips() {
@@ -244,22 +358,22 @@ function renderClips() {
   if (names.length === 0) {
     container.innerHTML = '<div class="empty">No clips yet. Record one above!</div>';
   } else {
-    container.innerHTML = names.map(n => `
-      <div class="clip-item">
-        <span>${esc(n)}</span>
-        <div class="clip-actions">
-          <button class="btn-play" onclick="playClip('${esc(n)}')">Play</button>
-          <button class="btn-delete" onclick="deleteClip('${esc(n)}')">Delete</button>
-        </div>
-      </div>
-    `).join('');
+    container.innerHTML = names.map(n => {
+      const escaped = esc(n);
+      return '<div class="clip-item">' +
+        '<span>' + escaped + '</span>' +
+        '<div class="clip-actions">' +
+        '<button class="btn-play" onclick="playClip(\'' + escaped + '\')">Play</button>' +
+        '<button class="btn-delete" onclick="deleteClip(\'' + escaped + '\')">Delete</button>' +
+        '</div></div>';
+    }).join('');
   }
 
   // Update alarm dropdown
   const select = document.getElementById('alarmClip');
   const prev = select.value;
   select.innerHTML = names.length
-    ? names.map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join('')
+    ? names.map(n => '<option value="' + esc(n) + '">' + esc(n) + '</option>').join('')
     : '<option value="">-- record a clip first --</option>';
   if (prev && names.includes(prev)) select.value = prev;
 }
@@ -281,8 +395,7 @@ function addAlarm() {
   const id = alarmCounter++;
   const ms = interval * 60 * 1000;
 
-  // Play immediately once, then repeat
-  const timerId = setInterval(() => playClip(clipName), ms);
+  const timerId = setInterval(() => triggerAlarm(clipName), ms);
 
   alarms[id] = { clip: clipName, interval, timerId };
   saveAlarms();
@@ -307,14 +420,13 @@ function renderAlarms() {
   } else {
     container.innerHTML = ids.map(id => {
       const a = alarms[id];
-      return `
-        <div class="alarm-item">
-          <div class="alarm-info">
-            <div class="alarm-name">"${esc(a.clip)}"</div>
-            <div class="alarm-detail">every ${a.interval} min</div>
-          </div>
-          <button class="btn-remove" onclick="removeAlarm(${id})">Remove</button>
-        </div>`;
+      return '<div class="alarm-item">' +
+        '<div class="alarm-info">' +
+        '<div class="alarm-name">"' + esc(a.clip) + '"</div>' +
+        '<div class="alarm-detail">every ' + a.interval + ' min</div>' +
+        '</div>' +
+        '<button class="btn-remove" onclick="removeAlarm(' + id + ')">Remove</button>' +
+        '</div>';
     }).join('');
   }
 }
@@ -334,7 +446,7 @@ async function loadAlarms() {
     if (!clips[a.clip]) continue;
     const numId = parseInt(id);
     const ms = a.interval * 60 * 1000;
-    const timerId = setInterval(() => playClip(a.clip), ms);
+    const timerId = setInterval(() => triggerAlarm(a.clip), ms);
     alarms[numId] = { clip: a.clip, interval: a.interval, timerId };
     if (numId >= alarmCounter) alarmCounter = numId + 1;
   }
@@ -342,9 +454,9 @@ async function loadAlarms() {
 }
 
 // ── Helpers ──
-function esc(s) { return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function esc(s) { return s.replace(/[&<>"']/g, function(c) { return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]; }); }
 function setStatus(id, msg, cls) {
-  const el = document.getElementById(id);
+  var el = document.getElementById(id);
   el.textContent = msg;
   el.className = 'status ' + (cls || '');
 }
