@@ -94,12 +94,28 @@
     border-radius: 14px; font-size: 1.1rem; font-weight: 700;
     border: none; cursor: pointer; margin-top: 12px;
   }
+
+  /* Background keepalive status */
+  .keepalive-bar {
+    width: 100%; max-width: 420px; margin-bottom: 16px;
+    background: #1e293b; border-radius: 12px; padding: 14px 16px;
+    display: none; text-align: center;
+  }
+  .keepalive-bar.active { display: block; }
+  .keepalive-bar .ka-status { font-size: 0.85rem; color: #22c55e; }
+  .keepalive-bar .ka-hint { font-size: 0.75rem; color: #64748b; margin-top: 4px; }
 </style>
 </head>
 <body>
 
 <h1>Voice Alarm</h1>
 <p class="subtitle">Record your voice and set recurring reminders</p>
+
+<!-- KEEPALIVE STATUS -->
+<div class="keepalive-bar" id="keepaliveBar">
+  <div class="ka-status">&#9989; Alarms active — running in background</div>
+  <div class="ka-hint">Keep this tab open. You can lock your screen.</div>
+</div>
 
 <!-- RECORD SECTION -->
 <div class="card">
@@ -134,8 +150,12 @@
   <div id="alarmsList"><div class="empty">No alarms set.</div></div>
 </div>
 
-<!-- Audio element for playback -->
+<!-- Audio element for manual playback (Play button) -->
 <audio id="player" playsinline webkit-playsinline></audio>
+<!-- Audio element for alarm playback (separate so they don't conflict) -->
+<audio id="alarmPlayer" playsinline webkit-playsinline></audio>
+<!-- Audio element for silent keepalive loop (keeps iOS from suspending the page) -->
+<audio id="keepalive" playsinline webkit-playsinline loop></audio>
 
 <!-- ALARM POPUP OVERLAY -->
 <div class="alarm-overlay" id="alarmOverlay">
@@ -290,12 +310,113 @@ function stopRecording() {
   document.getElementById('recordBtn').classList.remove('recording');
 }
 
-// ── Alarm trigger ──
-function triggerAlarm(clipName) {
-  if (!clipBlobs[clipName]) return;
-  if (navigator.vibrate) navigator.vibrate([300, 100, 300, 100, 300]);
-  showAlarmOverlay(clipName);
+// ── Silent keepalive ──
+// iOS suspends JS timers when the screen is off UNLESS audio is playing.
+// We play a near-silent WAV on loop to trick iOS into keeping the page alive.
+var keepaliveRunning = false;
+
+function generateSilentWav() {
+  // Generate a 2-second WAV of near-silence (value 128 = silence in 8-bit unsigned PCM)
+  var sampleRate = 8000;
+  var duration = 2;
+  var numSamples = sampleRate * duration;
+  var dataSize = numSamples;
+  var fileSize = 44 + dataSize;
+
+  var buffer = new ArrayBuffer(fileSize);
+  var view = new DataView(buffer);
+
+  // WAV header
+  function writeString(offset, str) { for (var i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i)); }
+  writeString(0, 'RIFF');
+  view.setUint32(4, fileSize - 8, true);
+  writeString(8, 'WAVE');
+  writeString(12, 'fmt ');
+  view.setUint32(16, 16, true);       // chunk size
+  view.setUint16(20, 1, true);        // PCM
+  view.setUint16(22, 1, true);        // mono
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate, true); // byte rate
+  view.setUint16(32, 1, true);        // block align
+  view.setUint16(34, 8, true);        // bits per sample
+  writeString(36, 'data');
+  view.setUint32(40, dataSize, true);
+
+  // Near-silent audio data (128 = silence for unsigned 8-bit, use 129 so it's not pure digital silence)
+  for (var i = 0; i < numSamples; i++) {
+    view.setUint8(44 + i, 128 + (i % 2)); // alternates 128/129 — inaudible but not pure zero
+  }
+
+  return new Blob([buffer], { type: 'audio/wav' });
 }
+
+function startKeepalive() {
+  if (keepaliveRunning) return;
+  var blob = generateSilentWav();
+  var url = URL.createObjectURL(blob);
+  var ka = document.getElementById('keepalive');
+  ka.src = url;
+  ka.volume = 0.01; // as quiet as possible
+  ka.load();
+  var p = ka.play();
+  if (p && p.then) {
+    p.then(function() {
+      keepaliveRunning = true;
+      document.getElementById('keepaliveBar').classList.add('active');
+    }).catch(function() {
+      // If autoplay blocked, it'll start on next user tap
+    });
+  }
+}
+
+function stopKeepalive() {
+  var ka = document.getElementById('keepalive');
+  ka.pause();
+  ka.src = '';
+  keepaliveRunning = false;
+  document.getElementById('keepaliveBar').classList.remove('active');
+}
+
+// ── Alarm trigger ──
+// Uses a timestamp-based system instead of setInterval (more reliable when iOS wakes up)
+var alarmTimestamps = {}; // { id: nextFireTime }
+
+function checkAlarms() {
+  var now = Date.now();
+  for (var id in alarms) {
+    if (!alarms.hasOwnProperty(id)) continue;
+    if (!alarmTimestamps[id]) continue;
+    if (now >= alarmTimestamps[id]) {
+      // Time to fire!
+      var clipName = alarms[id].clip;
+      var interval = alarms[id].interval;
+      // Set next fire time
+      alarmTimestamps[id] = now + (interval * 60 * 1000);
+
+      // Play the alarm audio directly using the alarm player
+      if (clipBlobs[clipName]) {
+        var url = URL.createObjectURL(clipBlobs[clipName]);
+        var ap = document.getElementById('alarmPlayer');
+        ap.src = url;
+        ap.load();
+        var p = ap.play();
+        if (p && p.then) {
+          p.then(function(u) { return function() {
+            ap.onended = function() { URL.revokeObjectURL(u); };
+          }; }(url)).catch(function() {
+            // Playback blocked — show overlay
+            showAlarmOverlay(clipName);
+          });
+        }
+      }
+      // Vibrate
+      if (navigator.vibrate) navigator.vibrate([300, 100, 300, 100, 300]);
+    }
+  }
+}
+
+// Check alarms every second
+setInterval(checkAlarms, 1000);
 
 function showAlarmOverlay(clipName) {
   pendingAlarms.push(clipName);
@@ -304,7 +425,6 @@ function showAlarmOverlay(clipName) {
 }
 
 document.getElementById('alarmDismissBtn').addEventListener('click', function() {
-  // User tap = user gesture, audio plays on iOS
   while (pendingAlarms.length > 0) {
     playClip(pendingAlarms.shift());
   }
@@ -354,19 +474,26 @@ function addAlarm() {
 
   var id = alarmCounter++;
   var ms = interval * 60 * 1000;
-  var timerId = setInterval(function() { triggerAlarm(clipName); }, ms);
 
-  alarms[id] = { clip: clipName, interval: interval, timerId: timerId };
+  alarms[id] = { clip: clipName, interval: interval };
+  alarmTimestamps[id] = Date.now() + ms; // first fire after one interval
+
   saveAlarms();
   renderAlarms();
+
+  // Start keepalive so alarms work with screen off
+  startKeepalive();
 }
 
 function removeAlarm(id) {
   if (alarms[id]) {
-    clearInterval(alarms[id].timerId);
     delete alarms[id];
+    delete alarmTimestamps[id];
     saveAlarms();
     renderAlarms();
+
+    // Stop keepalive if no alarms left
+    if (Object.keys(alarms).length === 0) stopKeepalive();
   }
 }
 
@@ -403,17 +530,20 @@ async function saveAlarms() {
 async function loadAlarms() {
   var data = await dbGet('alarms', 'active');
   if (!data) return;
+  var hasAlarms = false;
   for (var id in data) {
     if (!data.hasOwnProperty(id)) continue;
     var a = data[id];
     if (!clipBlobs[a.clip]) continue;
     var numId = parseInt(id);
     var ms = a.interval * 60 * 1000;
-    var timerId = setInterval((function(clip) { return function() { triggerAlarm(clip); }; })(a.clip), ms);
-    alarms[numId] = { clip: a.clip, interval: a.interval, timerId: timerId };
+    alarms[numId] = { clip: a.clip, interval: a.interval };
+    alarmTimestamps[numId] = Date.now() + ms;
     if (numId >= alarmCounter) alarmCounter = numId + 1;
+    hasAlarms = true;
   }
   renderAlarms();
+  if (hasAlarms) startKeepalive();
 }
 
 // ── Helpers ──
